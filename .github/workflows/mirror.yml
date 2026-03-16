@@ -1,0 +1,107 @@
+name: Pixeldrain → SourceForge Mirror
+
+on:
+  workflow_dispatch:
+    inputs:
+      pd_url:
+        description: 'Pixeldrain File URL'
+        required: true
+        type: string
+      sf_user:
+        description: 'SourceForge Username'
+        required: true
+        type: string
+      sf_project:
+        description: 'SourceForge Project Name'
+        required: true
+        type: string
+      sf_folder:
+        description: 'SourceForge Folder Path (Optional)'
+        required: false
+        type: string
+        default: ''
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    env:
+      PD_URL: ${{ inputs.pd_url }}
+      SF_USER: ${{ inputs.sf_user }}
+      SF_PROJ: ${{ inputs.sf_project }}
+      SF_FOLD: ${{ inputs.sf_folder }}
+      # ANSI Color Codes for Console
+      CYAN: '\033[0;36m'
+      GREEN: '\033[0;32m'
+      YELLOW: '\033[1;33m'
+      BLUE: '\033[0;34m'
+      NC: '\033[0m'
+
+    steps:
+      - name: Extract Pixeldrain metadata
+        run: |
+          echo -e "${BLUE}=======================================${NC}"
+          echo -e "${CYAN}🔍 ANALYZING PIXELDRAIN URL...${NC}"
+          FILE_ID=$(echo "${PD_URL}" | sed -E 's/.*\/(u|file)\/([a-zA-Z0-9]+).*/\2/')
+          INFO_JSON=$(curl -sL "https://pixeldrain.com/api/file/${FILE_ID}/info")
+          FILE_NAME=$(echo "$INFO_JSON" | jq -r '.name // empty')
+          
+          if [ -z "$FILE_NAME" ] || [ "$FILE_NAME" = "null" ]; then
+            echo -e "${YELLOW}❌ Error: File not found.${NC}"
+            exit 1
+          fi
+          
+          echo -e "${GREEN}✅ Detected: $FILE_NAME${NC}"
+          echo "FILE_ID=$FILE_ID" >> $GITHUB_ENV
+          echo "FILE_NAME=$FILE_NAME" >> $GITHUB_ENV
+
+      - name: Download file
+        run: |
+          echo -e "${CYAN}📥 DOWNLOADING...${NC}"
+          curl -L --progress-bar --fail "https://pixeldrain.com/api/file/${FILE_ID}" -o "$FILE_NAME"
+          BYTES=$(stat -c%s "$FILE_NAME")
+          HUMAN=$(numfmt --to=iec-i --suffix=B "$BYTES")
+          echo "FILE_SIZE=$HUMAN" >> $GITHUB_ENV
+          echo -e "${YELLOW}📦 SIZE: $HUMAN${NC}"
+
+      - name: Setup SSH key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SF_SSH_KEY }}" > ~/.ssh/sf_key
+          chmod 600 ~/.ssh/sf_key
+          ssh-keyscan frs.sourceforge.net >> ~/.ssh/known_hosts
+
+      - name: Upload to SourceForge
+        run: |
+          TARGET_PATH="/home/frs/project/${SF_PROJ}/"
+          if [ -n "${SF_FOLD}" ]; then
+            TARGET_FOLDER=$(echo "${SF_FOLD}" | sed 's:^/*::' | sed 's:/*$::')
+            TARGET_PATH="/home/frs/project/${SF_PROJ}/${TARGET_FOLDER}/"
+          fi
+          echo -e "${CYAN}📤 UPLOADING TO SOURCEFORGE...${NC}"
+          rsync -av --info=progress2 -e "ssh -i ~/.ssh/sf_key -o StrictHostKeyChecking=no" \
+            "$FILE_NAME" "${SF_USER}@frs.sourceforge.net:${TARGET_PATH}"
+
+      - name: Generate Checksums
+        run: |
+          MD5=$(md5sum "$FILE_NAME" | awk '{print $1}')
+          SHA=$(sha256sum "$FILE_NAME" | awk '{print $1}')
+          echo "MD5_SUM=$MD5" >> $GITHUB_ENV
+          echo "SHA_SUM=$SHA" >> $GITHUB_ENV
+          echo -e "${GREEN}🔐 CHECKSUMS GENERATED${NC}"
+
+      - name: Telegram Notification
+        if: always()
+        run: |
+          if [ "${{ job.status }}" = "success" ]; then
+            STATUS="✅ <b>Mirror Success!</b>"
+            TEXT="$STATUS%0A%0A<b>File:</b> <code>${{ env.FILE_NAME }}</code>%0A<b>Size:</b> ${{ env.FILE_SIZE }}%0A<b>Project:</b> ${{ inputs.sf_project }}%0A%0A<b>MD5:</b> <code>${{ env.MD5_SUM }}</code>%0A<b>SHA256:</b> <code>${{ env.SHA_SUM }}</code>"
+          else
+            STATUS="❌ <b>Mirror Failed!</b>"
+            LOG_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            TEXT="$STATUS%0A%0A<b>Project:</b> ${{ inputs.sf_project }}%0A<a href='$LOG_URL'>View Error Logs</a>"
+          fi
+          
+          curl -s -X POST "https://api.telegram.org/bot${{ secrets.TG_BOT_TOKEN }}/sendMessage" \
+            -d "chat_id=${{ secrets.TG_CHAT_ID }}" \
+            -d "parse_mode=HTML" \
+            -d "text=$TEXT"
